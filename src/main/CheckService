@@ -1,0 +1,155 @@
+import com.google.common.collect.Lists;
+
+import rx.Observable;
+import rx.schedulers.Schedulers;
+
+@Service
+public class CheckService {
+    
+    private static Logger log = LoggerFactory.getLogger(CheckService.class);
+    @Autowired
+    @Regular
+    private TaskExecutor taskExecutor;
+    @Autowired
+    private UserListVerificationResultDataRedisStore userListVerificationResultDataStore;
+    @Autowired
+    private EventHelper eventHelper;
+    @Autowired
+    private SamplerHelper securelySamplerHelper;
+    @Autowired
+    private TestEmailHelper runWayHelper;
+    @Autowired
+    private VerificationResultDataStoreImpl verificationResultDataStore;
+    @Autowired
+    private RateControlService rateControlService;
+    @Value("${securely.check.enabled:false}")
+    private boolean securelyCheckEnabled;
+    @Autowired
+    private EventService securelyEventService;
+
+    public Observable<VerificationResultWrapper> getResult(Observable<UserInputDataInfo> userInputDataInfoStream) {
+        if (!securelyCheckEnabled) {
+            return Observable.empty();
+        }
+        Observable<CheckContextBuilder> contextStream = userInputDataInfoStream.map(info -> CheckContextBuilder.aCheckContextBuilder().withUserInputDataInfo(info));
+        Observable<CheckContextBuilder> checkStream = 
+                getWhiteListEmailVerificationResult(userInputDataInfoStream).zipWith(contextStream, (whiteListEmailResult, context) -> context.withWhiteListEmail(whiteListEmailResult))
+                .zipWith(getBlackListIpVerificationResult(userInputDataInfoStream), (context, blackListIpResult) -> context.withBlackListIp(blackListIpResult))
+                .zipWith(getWhiteListIpVerificationResult(userInputDataInfoStream), (context, whiteListIpResult) -> context.withWhiteListIp(whiteListIpResult))
+                .zipWith(getStoredRegistrationResult(userInputDataInfoStream), (context, cachedResult) -> context.withCachedResult(cachedResult))
+                .zipWith(getSampledVerificationResult(userInputDataInfoStream), (context, sampledResult) -> context.withUserSampled(sampledResult))
+                .zipWith(getIpRateResult(userInputDataInfoStream), (context, isWithinIpRate) -> context.withWithinIpRate(isWithinIpRate))
+                .zipWith(getUserAgentRateResult(userInputDataInfoStream), (context, isWithinUserAgentRate) -> context.withWithinUserAgentRate(isWithinUserAgentRate));
+        
+        return checkStream.map(context -> processContext(context.build())).filter(result -> result != null);
+    }
+
+    private VerificationResultWrapper processContext(CheckContext context) {
+        log.debug("context : {}", context);
+        if (context.getWhiteListEmail() != null) {
+            log.debug("White List Email result : {}", context.getWhiteListEmail());
+            return context.getWhiteListEmail();
+        }
+        if (context.getWhiteListIp() != null) {
+            log.debug("WhiteListIp Result : {}", context.getWhiteListIp());
+            return context.getWhiteListIp();
+        }
+        if (context.getBlackListIp() != null) {
+            log.debug("Black ListIp result : {}", context.getBlackListIp());
+            return context.getBlackListIp();
+        }
+        if (BooleanUtils.isFalse(context.getWithinIpRate())) {
+            log.info("[IP] User made too many requests " +
+                    "|userId|"+context.getUserInputDataInfo().getUserId()+
+                    "|ips|"+context.getUserInputDataInfo().getClientIps()+
+                    "|ua|" + context.getUserInputDataInfo().getUserAgent() +
+                    "|email|" + context.getUserInputDataInfo().getUserEmail()+
+                    "|platform|"+context.getUserInputDataInfo().getPlatform());
+            securelyEventService.sendTooMayRequestEvent(context.getUserInputDataInfo());
+            throw new TooManyRequestsException("[IP] User made too many requests");
+        }
+        if (BooleanUtils.isFalse(context.getWithinUserAgentRate())) {
+            log.info("[UA] User made too many requests " +
+                    "|userId|"+context.getUserInputDataInfo().getUserId()+
+                    "|ips|"+context.getUserInputDataInfo().getClientIps()+
+                    "|ua|" + context.getUserInputDataInfo().getUserAgent() +
+                    "|email|" + context.getUserInputDataInfo().getUserEmail()+
+                    "|platform|"+context.getUserInputDataInfo().getPlatform());
+            securelyEventService.sendTooMayRequestEvent(context.getUserInputDataInfo());
+            throw new TooManyRequestsException("[UA] User made too many requests");
+        }
+        if (context.getCachedResult() != null) {
+            log.debug("Cached Result : {}", context.getCachedResult());
+            return context.getCachedResult();
+        }
+        if (context.getUserSampled() != null) {
+            log.debug("User Sampled Result : {}", context.getUserSampled());
+            return context.getUserSampled();
+        }
+        return null;
+    }
+    
+    private Observable<VerificationResultWrapper> getStoredRegistrationResult(
+            Observable<UserInputDataInfo> userInputDataInfoStream) {
+        Observable<UserInputDataInfo> userInputStream = userInputDataInfoStream.cache();
+        return userInputStream.observeOn(Schedulers.from(taskExecutor))
+                .filter(userInputDataInfo -> StringUtils.isNotEmpty(userInputDataInfo.getIovationValue()))
+                .filter(userInputDataInfo -> !runWayHelper.isRunwayEmail(userInputDataInfo.getUserEmail()))
+                .map(userInputDataInfo -> verificationResultDataStore.find(userInputDataInfo.getIovationValue()))
+                .filter(result -> result != null)
+                .zipWith(userInputStream, (result, input) -> {
+                    return eventHelper.updateResultDetails(input, result);
+                })
+                .switchIfEmpty(Observable.just(null));
+    }
+
+    private Observable<VerificationResultWrapper> getWhiteListEmailVerificationResult(
+            Observable<UserInputDataInfo> userInputDataInfoStream) {
+        return userInputDataInfoStream.observeOn(Schedulers.from(taskExecutor))
+                .filter(userInputDataInfo -> StringUtils.isNotEmpty(userInputDataInfo.getUserEmail()))
+                .map(userInputDataInfo -> userListVerificationResultDataStore
+                        .findWhiteListedVerificationResult(userInputDataInfo))
+                .switchIfEmpty(Observable.just(null));
+    }
+
+    private Observable<VerificationResultWrapper> getBlackListIpVerificationResult(
+            Observable<UserInputDataInfo> userInputDataInfoStream) {
+        return userInputDataInfoStream.observeOn(Schedulers.from(taskExecutor))
+                .filter(userInputDataInfo -> CollectionUtils.isNotEmpty(userInputDataInfo.getClientIps()))
+                .map(userInputDataInfo -> userListVerificationResultDataStore
+                        .findBlackListedVerificationResult(userInputDataInfo))
+                .switchIfEmpty(Observable.just(null));
+    }
+    
+    private Observable<VerificationResultWrapper> getWhiteListIpVerificationResult(
+            Observable<UserInputDataInfo> userInputDataInfoStream) {
+        return userInputDataInfoStream.observeOn(Schedulers.from(taskExecutor))
+                .filter(userInputDataInfo -> CollectionUtils.isNotEmpty(userInputDataInfo.getClientIps()))
+                .map(userInputDataInfo -> userListVerificationResultDataStore
+                        .findWhiteListedIpVerificationResult(userInputDataInfo))
+                .switchIfEmpty(Observable.just(null));
+    }
+    
+    private Observable<Boolean> getIpRateResult(
+            Observable<UserInputDataInfo> userInputDataInfoStream) {
+        return userInputDataInfoStream.observeOn(Schedulers.from(taskExecutor))
+                .map(userInputDataInfo -> rateControlService.isRequestWithinIpRate(userInputDataInfo));
+    }
+    
+    private Observable<Boolean> getUserAgentRateResult(
+            Observable<UserInputDataInfo> userInputDataInfoStream) {
+        return userInputDataInfoStream.observeOn(Schedulers.from(taskExecutor))
+                .map(userInputDataInfo -> rateControlService.isRequestWithinUserAgentRate(userInputDataInfo));
+    }
+
+    private Observable<VerificationResultWrapper> getSampledVerificationResult(
+            Observable<UserInputDataInfo> userInputDataInfoStream) {
+        return userInputDataInfoStream.observeOn(Schedulers.from(taskExecutor))
+                .filter(userInputDataInfo -> !securelySamplerHelper.isSampled(userInputDataInfo))
+                .map(userInputDataInfo -> VerificationResultWrapper.VerificationResultWrapperBuilder
+                        .aVerificationResultWrapper().withUserAllowType(UserAllowType.ALLOW)
+                        .withTriggeredRules(Lists.newArrayList()).withUniqueId(userInputDataInfo.getEventId()).build())
+                .switchIfEmpty(Observable.just(null));
+    }
+
+}
